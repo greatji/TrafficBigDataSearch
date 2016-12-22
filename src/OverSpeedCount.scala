@@ -1,9 +1,10 @@
 package org.dbgroup.trafficbigdata.overspeedcount
 
 import org.apache.spark.sql.SQLContext
-import org.apache.spark.{SparkConf, SparkContext}
+import org.apache.spark.SparkContext
 import org.joda.time._
 import org.joda.time.format._
+import scala.collection.JavaConverters._
 /**
   * Created by sunji on 16/12/12.
   */
@@ -13,36 +14,36 @@ case class SPEED_DATA(SITE_GUID: String, HPHM: String, WZSJMillis: Long, WZSJHou
 case class FEE_DATA(EXSTATION: String, EXTIMEMillis: Long, ENSTATION: String, ENTIMEMillis: Long, EXVEHCLASS: String, ENVEHPLATE: String, EXVEHPLATE: String, EXTRUCKFLAG: String)
 
 object OverSpeedCount {
-  def main(args: Array[String]): Unit = {
-    val sparkConf = new SparkConf().setAppName("TrafficBigData")//.setMaster("local")
-    val sparkContext = new SparkContext(sparkConf)
-    val sqlContext = new SQLContext(sparkContext)
 
-    // 参数传入
-    val data_path_base = args(0)
-    val lon_upper = args(1).toDouble // 106.0
-    val lon_lower = args(2).toDouble // 105.0
-    val lat_upper = args(3).toDouble // 30.0
-    val lat_lower = args(4).toDouble // 29.0
-    val start_day = args(5).toInt // 1
-    val start_month = args(6).toInt // 6
-    val start_year = args(7).toInt // 2016
-    val end_day = args(8).toInt // 1
-    val end_month = args(9).toInt // 6
-    val end_year = args(10).toInt // 2016
+  def getOverSpeedCount(sparkContext: SparkContext, sqlContext: SQLContext, data_path_base: String, lon_upper: Double, lon_lower: Double, lat_upper: Double, lat_lower: Double, start_date: String, end_date: String): java.util.List[String] = {
 
-    val start = new DateTime(start_year, start_month, start_day, 0, 0, 0)
-    val end = new DateTime(end_year, end_month, end_day, 0, 0, 0)
+    val fmt = DateTimeFormat.forPattern("yyyy-MM-dd")
+    val start = DateTime.parse(start_date, fmt)
+    val end = DateTime.parse(end_date, fmt)
     // 数据预处理
 
+    val speed_base_path = data_path_base + "/speed_base.csv"
+    val speed_base_source = sparkContext
+      .textFile(speed_base_path)
+      .map(x => (x.split(",")))
+      .filter(x => x.length == 8)
+      .filter(x => (x(6).length > 0 && x(7).length > 0))
+      .map(x => (x(0), x(1), x(2), x(3), x(4), x(5), x(6).toDouble, x(7).toDouble))
+    import sqlContext.implicits._
+    val speed_base = speed_base_source
+      .map(x => SPEED_BASE(x._1, x._2, x._3, x._4, x._5, x._6, x._7, x._8)).toDF()
+    speed_base.registerTempTable("speed_base")
+    val speed_guid = sqlContext.sql("SELECT GDCSYBM FROM speed_base WHERE LON BETWEEN "+lon_lower+" AND "+lon_upper+" AND LAT BETWEEN " +lat_lower+ " AND "+lat_upper)
+    speed_guid.registerTempTable("speed_guid")
+    sqlContext.sql("cache table speed_guid").count()
+
     var sqlStatement = ""
-    var i = new DateTime(start_year, start_month, start_day, 0, 0, 0)
+    var i = DateTime.parse(start_date, fmt)
     while (!(i.getYear == end.plusMonths(1).getYear && i.getMonthOfYear == end.plusMonths(1).getMonthOfYear)) {
       val thisMonthFilePath = (i.getYear*100 + i.getMonthOfYear).toString
 
       println("begin: " + thisMonthFilePath)
 
-      val speed_base_path = data_path_base + "/speed_base.csv"
       val speed_data_path = data_path_base + "/" + thisMonthFilePath + "/" + thisMonthFilePath + "CSYDATA.csv"
       val fee_data_path = data_path_base + "/" + thisMonthFilePath + "/" + thisMonthFilePath + "SFZDATA.csv"
 
@@ -61,13 +62,6 @@ object OverSpeedCount {
           (new DateTime(i.getYear, i.getMonthOfYear, 1, 0, 0, 0)).plusMonths(1).getMillis
         }
       }
-
-      val speed_base_source = sparkContext
-        .textFile(speed_base_path)
-        .map(x => (x.split(",")))
-        .filter(x => x.length == 8)
-        .filter(x => (x(6).length > 0 && x(7).length > 0))
-        .map(x => (x(0), x(1), x(2), x(3), x(4), x(5), x(6).toDouble, x(7).toDouble))
 
       val speed_data_source = sparkContext
         .textFile(speed_data_path)
@@ -112,9 +106,6 @@ object OverSpeedCount {
 
       // 构造注册数据表
       import sqlContext.implicits._
-      val speed_base = speed_base_source
-        .map(x => SPEED_BASE(x._1, x._2, x._3, x._4, x._5, x._6, x._7, x._8)).toDF()
-      speed_base.registerTempTable("speed_base_"+thisMonthFilePath)
       val speed_data = speed_data_source
         .map(x => SPEED_DATA(x._1, x._2, x._3, x._4, x._5, x._6)).toDF()
       speed_data.registerTempTable("speed_data_"+thisMonthFilePath)
@@ -123,14 +114,10 @@ object OverSpeedCount {
       fee_data.registerTempTable("fee_data_"+thisMonthFilePath)
 
       // 查询
-      val speed_guid = sqlContext.sql("SELECT GDCSYBM FROM speed_base_"+ thisMonthFilePath +" WHERE LON BETWEEN "+lon_lower+" AND "+lon_upper+" AND LAT BETWEEN " +lat_lower+ " AND "+lat_upper)
-      speed_guid.registerTempTable("speed_guid_" + thisMonthFilePath)
       val speed_info = sqlContext.sql("select SITE_GUID, HPHM, WZSJMillis, CLSD, WZSJHourOfDay from speed_data_"+thisMonthFilePath+" where WZSJMillis BETWEEN " + startTime + " AND " + endTime)
       speed_info.registerTempTable("speed_info_" + thisMonthFilePath)
-      val speed = sqlContext.sql("select speed_info_"+thisMonthFilePath+".SITE_GUID as guid, speed_info_"+thisMonthFilePath+".HPHM as plate, speed_info_"+thisMonthFilePath+".WZSJMillis as time, speed_info_"+thisMonthFilePath+".CLSD as speed, speed_info_"+thisMonthFilePath+".WZSJHourOfDay as hour from speed_guid_"+thisMonthFilePath+" JOIN speed_info_"+thisMonthFilePath+" ON speed_guid_"+thisMonthFilePath+".GDCSYBM=speed_info_"+thisMonthFilePath+".SITE_GUID")
+      val speed = sqlContext.sql("select speed_info_"+thisMonthFilePath+".SITE_GUID as guid, speed_info_"+thisMonthFilePath+".HPHM as plate, speed_info_"+thisMonthFilePath+".WZSJMillis as time, speed_info_"+thisMonthFilePath+".CLSD as speed, speed_info_"+thisMonthFilePath+".WZSJHourOfDay as hour from speed_guid JOIN speed_info_"+thisMonthFilePath+" ON speed_guid.GDCSYBM=speed_info_"+thisMonthFilePath+".SITE_GUID")
       speed.registerTempTable("speed_" + thisMonthFilePath)
-      val fee_data_ = sqlContext.sql("select EXTIMEMillis, ENTIMEMillis, ENVEHPLATE, EXVEHPLATE, EXVEHCLASS, EXTRUCKFLAG from fee_data_"+thisMonthFilePath)
-      fee_data.registerTempTable("fee_data_" + thisMonthFilePath)
 
       //    val speed_class_time = sqlContext.sql("select speed.speed as speed, speed.hour as hour, fee_data.EXVEHCLASS as class, fee_data.EXTRUCKFLAG as type from speed join fee_data on speed.plate=fee_data.ENVEHPLATE or speed.plate=fee_data.EXVEHPLATE where speed.time between fee_data.ENTIMEMillis and fee_data.EXTIMEMillis")
       val speed_class_time = sqlContext.sql("select speed_"+thisMonthFilePath+".speed as speed, speed_"+thisMonthFilePath+".hour as hour, fee_data_"+thisMonthFilePath+".EXVEHCLASS as class, fee_data_"+thisMonthFilePath+".EXTRUCKFLAG as type from speed_"+thisMonthFilePath+" join fee_data_"+thisMonthFilePath+" on speed_"+thisMonthFilePath+".plate=fee_data_"+thisMonthFilePath+".ENVEHPLATE where speed_"+thisMonthFilePath+".time between fee_data_"+thisMonthFilePath+".ENTIMEMillis and fee_data_"+thisMonthFilePath+".EXTIMEMillis")
@@ -143,11 +130,11 @@ object OverSpeedCount {
 
     println(sqlStatement)
 
-    sqlContext.sql("select COUNT(*) as overspeedcount, S.hour from (" + sqlStatement + ") S where S.class=1 and S.type=0 and S.speed > 120 group by S.hour").toJSON.saveAsTextFile(args(11) + "/over_speed_count_small_bus")
-    sqlContext.sql("select COUNT(*) as overspeedcount, S.hour from (" + sqlStatement + ") S where S.class>1 and S.type=0 and S.speed > 120 group by S.hour").toJSON.saveAsTextFile(args(11) + "/over_speed_count_big_bus")
-    sqlContext.sql("select COUNT(*) as overspeedcount, S.hour from (" + sqlStatement + ") S where S.class=1 and S.type=1 and S.speed > 120 group by S.hour").toJSON.saveAsTextFile(args(11) + "/over_speed_count_small_truck")
-    sqlContext.sql("select COUNT(*) as overspeedcount, S.hour from (" + sqlStatement + ") S where S.class>1 and S.type=1 and S.speed > 100 group by S.hour").toJSON.saveAsTextFile(args(11) + "/over_speed_count_big_truck")
+    val overSpeedCount1 = sqlContext.sql("select \"01\" as car_type, S.hour as time_period, COUNT(*) as speed_limit_num from (" + sqlStatement + ") S where S.class=1 and S.type=0 and S.speed > 120 group by S.hour").toJSON.collect().toList
+    val overSpeedCount2 = sqlContext.sql("select \"02\" as car_type, S.hour as time_period, COUNT(*) as speed_limit_num from (" + sqlStatement + ") S where S.class>1 and S.type=0 and S.speed > 120 group by S.hour").toJSON.collect().toList
+    val overSpeedCount3 = sqlContext.sql("select \"03\" as car_type, S.hour as time_period, COUNT(*) as speed_limit_num from (" + sqlStatement + ") S where S.class=1 and S.type=1 and S.speed > 120 group by S.hour").toJSON.collect().toList
+    val overSpeedCount4 = sqlContext.sql("select \"04\" as car_type, S.hour as time_period, COUNT(*) as speed_limit_num from (" + sqlStatement + ") S where S.class>1 and S.type=1 and S.speed > 100 group by S.hour").toJSON.collect().toList
 
-    println("complete!!!")
+    return (overSpeedCount1 ::: overSpeedCount2 ::: overSpeedCount3 ::: overSpeedCount4).asJava
   }
 }
